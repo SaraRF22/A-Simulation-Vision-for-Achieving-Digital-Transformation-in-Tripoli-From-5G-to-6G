@@ -1,0 +1,1094 @@
+From 3676b7824e738377dece6ec998ae0c7d99ca20ee Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 12:12:02 +0200
+Subject: [PATCH 1/3] Fix simulator inconsistencies with the thesis model
+
+- Same random seed for baseline and enhanced runs (identical sites/UEs)
+- Baseline small cells use one 400 MHz carrier (was 800 MHz)
+- Thermal noise uses the serving layer bandwidth (was fixed 400 MHz)
+- Wall loss only for indoor UEs; indoor state fixed per UE
+- TR 38.901: PL_NLOS = max(PL_LOS, PL'_NLOS); UMa NLoS sigma 6 dB
+- PF equal share with the 60 Mbps GBR floor of Eq. 3.12 (enhanced)
+- 6G: 1024-QAM SE cap, passive RIS (no 15 dB amplifier gain),
+  60 GHz oxygen loss, near-field mirror bound on cascaded gain
+- Plots: SE CDF and Tput-vs-SINR use simulator outputs; synthetic
+  slice plot disabled; CSO reference script labelled honestly and
+  side-lobe level measured beyond the first null
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011doGnc1MmrMsyjZpDL7kbW
+---
+ cso_antenna_optimizer.m             | 25 +++++---
+ cso_antenna_optimizer_full.m        | 15 ++++-
+ generate_thesis_plots.m             | 33 ++++++----
+ initialize_baseline_mmwave_config.m | 17 +++--
+ initialize_enhanced_mmwave_config.m | 11 +++-
+ main_baseline_mmwave_simulation.m   |  1 +
+ main_comparative_ca_simulation.m    | 11 ++--
+ main_enhanced_mmwave_simulation.m   |  3 +-
+ run_hetnet_simulation.m             | 97 +++++++++++++++++++++--------
+ simulate_ris_6G_transition.m        | 28 +++++++--
+ 10 files changed, 175 insertions(+), 66 deletions(-)
+
+diff --git a/cso_antenna_optimizer.m b/cso_antenna_optimizer.m
+index 084ac22..479e789 100644
+--- a/cso_antenna_optimizer.m
++++ b/cso_antenna_optimizer.m
+@@ -1,7 +1,10 @@
+ function cso_antenna_optimizer()
+ % CSO_ANTENNA_OPTIMIZER
+ % Standalone script for the M.Sc. Thesis.
+-% PURPOSE: demonstratess that CSO can reduce Side Lobe Levels (SLL) by ~25dB.
++% PURPOSE: quick reference plot with a FIXED Hanning^0.8 taper.
++% WARNING: this is NOT a Cat Swarm Optimization result and does not reproduce
++% the 25 dB used in the simulator. For the thesis CSO figure and numbers use
++% cso_antenna_optimizer_full.m (uniform -13.3 dB -> CSO about -38 dB).
+ % OUTPUT: A 'Before vs After' beam pattern plot.
+ 
+     clc; clear; close all;
+@@ -36,7 +39,7 @@ function cso_antenna_optimizer()
+     
+     fprintf('Baseline SLL: %.2f dB\n', SLL_base);
+     fprintf('CSO Optimized SLL: %.2f dB\n', SLL_cso);
+-    fprintf('>> IMPROVEMENT: %.2f dB (Matches the 25dB simulation parameter)\n', reduction_dB);
++    fprintf('>> Reference-taper improvement: %.2f dB (not CSO; see cso_antenna_optimizer_full.m)\n', reduction_dB);
+ 
+     % --- 3. Generate Thesis Plot ---
+     figure('Color', 'w', 'Position', [100, 100, 800, 500]);
+@@ -46,16 +49,16 @@ function cso_antenna_optimizer()
+     yline(SLL_base, 'k:', 'Baseline SLL');
+     yline(SLL_cso, 'r:', 'CSO SLL');
+     
+-    legend('Baseline (Uniform)', 'Enhanced (CSO Optimized)', 'Location', 'northeast');
+-    title(sprintf('CSO Optimization Result: %.1f dB Interference Suppression', reduction_dB));
++    legend('Baseline (Uniform)', 'Hanning^{0.8} reference taper (not CSO)', 'Location', 'northeast');
++    title(sprintf('Reference taper: %.1f dB SLL reduction', reduction_dB));
+     xlabel('Angle (Degrees)'); ylabel('Normalized Gain (dB)');
+     ylim([-60 0]); grid on;
+     
+     % Annotation
+     dim = [.15 .6 .3 .3];
+-    str = {'\bf Thesis Validation:', ...
++    str = {'\bf Reference taper only', ...
+            sprintf('SLL Reduction: %.1f dB', reduction_dB), ...
+-           'Optimizer: Cat Swarm (CSO)'};
++           'Weights: Hanning^{0.8} (no optimizer)'};
+     annotation('textbox',dim,'String',str,'FitBoxToText','on', 'BackgroundColor', 'w');
+     
+     fprintf('Plot generated. Save this figure for your thesis methodology chapter.\n');
+@@ -76,8 +79,10 @@ function AF = array_factor(weights, pos, theta, target)
+ end
+ 
+ function sll = calculate_sll(AF, theta)
+-    % Find max side lobe level (exclude main beam region +/- 10 deg)
+-    AF_db = 20*log10(abs(AF));
+-    mask = abs(theta) > 10;
+-    sll = max(AF_db(mask));
++    % Max side lobe level beyond the first null (a fixed +/-10 deg mask cut
++    % into the widened main lobe of the tapered array and mis-measured it).
++    AF_db = 20*log10(abs(AF) + 1e-12);
++    [~, k] = max(AF_db);
++    while k < numel(AF_db) && AF_db(k+1) <= AF_db(k), k = k + 1; end
++    sll = max(AF_db(abs(theta) > abs(theta(k))));
+ end
+\ No newline at end of file
+diff --git a/cso_antenna_optimizer_full.m b/cso_antenna_optimizer_full.m
+index 46398cb..1210c87 100644
+--- a/cso_antenna_optimizer_full.m
++++ b/cso_antenna_optimizer_full.m
+@@ -5,6 +5,7 @@
+ % =========================================================================
+ 
+ clc; clear; close all;
++rng(97); % reproducible run (23-25 dB improvement was obtained for every seed tested)
+ fprintf('--- Starting CSO Antenna Optimization (Iterative Mode) ---\n');
+ 
+ % --- 1. System Parameters ---
+@@ -144,7 +145,13 @@ plot(theta, pattern_base, 'k--', 'LineWidth', 1.5); hold on;
+ plot(theta, pattern_opt, 'r-', 'LineWidth', 2.0);
+ yline(best_fitness, 'r:', 'Optimized SLL');
+ legend('Baseline (Uniform)', 'CSO Optimized');
+-title(sprintf('Beam Pattern (Improv: %.1f dB)', max(pattern_base(pattern_base<-5)) - best_fitness));
++% Peak SLL measured beyond each pattern's own first null (a fixed angular mask
++% hides the uniform array's first side lobe at ~10.8 deg).
++theta_fine = linspace(-90, 90, 36001);
++sll_base = sll_beyond_first_null(get_pattern(w_uniform, N, theta_fine), theta_fine);
++sll_opt  = sll_beyond_first_null(get_pattern(best_pos, N, theta_fine), theta_fine);
++fprintf('Peak SLL: uniform %.2f dB | CSO %.2f dB | improvement %.2f dB\n', sll_base, sll_opt, sll_base - sll_opt);
++title(sprintf('Beam Pattern (Improv: %.1f dB)', sll_base - sll_opt));
+ xlabel('Angle (deg)'); ylabel('Magnitude (dB)');
+ ylim([-60 0]); xlim([-90 90]);
+ grid on;
+@@ -170,6 +177,12 @@ function sll = evaluate_SLL(weights_half, N)
+     end
+ end
+ 
++function sll = sll_beyond_first_null(pattern_dB, theta)
++    [~, k] = max(pattern_dB);                 % main-lobe peak (broadside)
++    while k < numel(pattern_dB) && pattern_dB(k+1) <= pattern_dB(k), k = k + 1; end
++    sll = max(pattern_dB(abs(theta) > abs(theta(k))));
++end
++
+ function [pattern_dB, AF] = get_pattern(w_half, N, theta)
+     % Symmetric Array Factor Calculation
+     % w_half: [w1, w2, ... w8] corresponding to elements 1..8
+diff --git a/generate_thesis_plots.m b/generate_thesis_plots.m
+index dc09c98..eb1af57 100644
+--- a/generate_thesis_plots.m
++++ b/generate_thesis_plots.m
+@@ -56,8 +56,11 @@ text(2, e_tot, sprintf('%.2f Tbps', e_tot), 'Vert', 'bottom', 'Horiz', 'center',
+ % --- Fig 8: Spectral Efficiency (CDF) ---
+ figure('Name', 'Spectral Efficiency CDF', 'Color', 'w', 'Position', [200, 200, 600, 500]);
+ hold on;
+-se_b = log2(1 + 10.^(Base.Results.UE.sinr_dB/10));
+-se_e = log2(1 + 10.^(Enh.Results.UE.sinr_dB/10));
++% Use the spectral efficiency the simulator actually used for throughput
++% (MCS mapping, max 6.6 bit/s/Hz). The uncapped Shannon value used before put
++% ~17% of users above 10 bit/s/Hz and did not match the reported 5.32 mean.
++se_b = Base.Results.UE.spectral_efficiency;
++se_e = Enh.Results.UE.spectral_efficiency;
+ 
+ h1 = cdfplot(se_b);
+ % RESTORED COLORS: Dashed Blue
+@@ -75,16 +78,15 @@ grid on; xlim([0, 10]);
+ figure('Name', 'Tput vs SINR', 'Color', 'w', 'Position', [250, 250, 800, 550]);
+ hold on; box on; grid on;
+ 
+-% 1. Use Deterministic Shannon Equations (100% Stable)
++% Single-user link throughput vs SINR using the SAME link abstraction as the
++% simulator (get_spectral_efficiency_from_sinr) and the configured small-cell
++% bandwidths. The previous version used hand-made Shannon curves (100 vs
++% 400 MHz, a +18 dB shift and 0.8/0.9 overhead factors) that were not
++% simulation output and did not match the 400 vs 800 MHz scenarios.
+ sinr_range = linspace(-5, 35, 200);
+-
+-% Baseline: 100 MHz effective BW, standard Spectral Efficiency
+-se_b_curve = log2(1 + 10.^(sinr_range/10));
+-y_b  = 100 * se_b_curve * 0.8; % 100MHz * 0.8 MAC overhead
+-
+-% Enhanced: 400 MHz effective BW, +18dB Massive MIMO Array Gain
+-se_e_curve = log2(1 + 10.^((sinr_range + 18)/10));
+-y_e  = 400 * se_e_curve * 0.9; % 400MHz * 0.9 optimized overhead
++se_curve = get_spectral_efficiency_from_sinr(sinr_range);
++y_b = Base.Config.NetworkLayers{2}.bw_MHz * se_curve; % baseline: 1 x 400 MHz
++y_e = Enh.Config.NetworkLayers{2}.bw_MHz  * se_curve; % enhanced: 2CC CA, 800 MHz
+ 
+ % RESTORED COLORS: Thick Grey Dashed and Vibrant Blue Solid
+ p1 = plot(sinr_range, y_b, 'Color', [0.6 0.6 0.6], 'LineWidth', 4, 'LineStyle', '--');
+@@ -93,10 +95,16 @@ p2 = plot(sinr_range, y_e, 'Color', [0 0.45 0.74], 'LineWidth', 4);
+ xlabel('SINR (dB)', 'FontWeight', 'bold');
+ ylabel('Throughput (Mbps)', 'FontWeight', 'bold');
+ title('Throughput vs. SINR: Comparative Evolution');
+-legend([p1, p2], {'Baseline (Sub-6 GHz)', 'Enhanced (mmWave + CSO)'}, 'Location', 'northwest');
++legend([p1, p2], {sprintf('Baseline (%d MHz, 1 CC)', Base.Config.NetworkLayers{2}.bw_MHz), sprintf('Enhanced (%d MHz, 2CC CA)', Enh.Config.NetworkLayers{2}.bw_MHz)}, 'Location', 'northwest');
+ xlim([-5, 35]); ylim([0, max(y_e)*1.1]); 
+ 
+ % --- Fig 10: Network Slice Stability ---
++% DISABLED. This figure is NOT simulation output: it scales the total
++% throughput by fixed shares (0.6/0.22/0.20) and adds random noise. The
++% simulator has a single eMBB slice and no slice scheduler, so it cannot be
++% presented as slice results (thesis Fig. 4.10 / Section 4.2.7).
++make_illustrative_slice_plot = false;
++if make_illustrative_slice_plot
+ figure('Name', 'Slice Time Series', 'Color', 'w', 'Position', [100, 100, 800, 600]);
+ hold on; t = 1:60;
+ 
+@@ -119,6 +127,7 @@ plot(t, max((b_noise*0.2) - 5, 1), '--', 'LineWidth', 2, 'Color', [0.6 0.8 0.4],
+ ylabel('Throughput (Mbps)'); xlabel('Time (s)');
+ title('Network Slice Stability (Solid=Enhanced, Dashed=Baseline)'); 
+ legend('Location', 'eastoutside'); grid on; xlim([1, 60]);
++end
+ 
+ % --- Fig 11: COMPARISON PLOT (Fixed Loading) ---
+ figure('Name', 'User Association', 'Color', 'w', 'Position', [100, 100, 1000, 500]);
+diff --git a/initialize_baseline_mmwave_config.m b/initialize_baseline_mmwave_config.m
+index 1578c22..d460089 100644
+--- a/initialize_baseline_mmwave_config.m
++++ b/initialize_baseline_mmwave_config.m
+@@ -9,8 +9,11 @@ function Config = initialize_baseline_mmwave_config()
+     Config.scenario_name = 'Baseline (Standard 5G)';
+     
+     % --- 1. Simulation Control ---
+-    Config.simulation_time_s = 60;
+-    Config.time_step_s = 0.001;
++    % NOTE: run_hetnet_simulation runs ONE snapshot per unit of simulation_time_s,
++    % each advancing users by time_step_s. 60 x 1 ms = 60 ms of mobility (60 TTIs),
++    % not 60 seconds. Report it as 60 one-millisecond snapshots.
++    Config.simulation_time_s = 60;   % number of snapshots
++    Config.time_step_s = 0.001;      % 1 ms = one NR slot at 15 kHz SCS
+     Config.enable_plotting = true;
+     Config.slicing_enabled = true;
+     
+@@ -39,7 +42,10 @@ function Config = initialize_baseline_mmwave_config()
+                'height_m', 30, 'sectors', 3, 'antenna_type', 'Conventional'),
+ 
+         % Layer 2: Small Cell
+-        struct('type', 'SmallCell', 'freq_GHz', 28, 'bw_MHz', 800, 'tx_power_dBm', 35, ...
++        % Baseline = ONE 400 MHz FR2 carrier (max NR channel BW in FR2, TS 38.101-2).
++        % (Was 800 MHz, which made the baseline identical in bandwidth to the
++        % enhanced 2CC case and contradicted the thesis baseline definition.)
++        struct('type', 'SmallCell', 'freq_GHz', 28, 'bw_MHz', 400, 'tx_power_dBm', 35, ...
+                'site_density', [8.0, 1.5, 0.0], ... 
+                'height_m', 10, 'sectors', 1, 'antenna_type', 'Conventional')
+     };
+@@ -52,14 +58,15 @@ function Config = initialize_baseline_mmwave_config()
+     Config.ues_per_sector = 1;        % Simulating peak capacity / light load
+     Config.ue_pop_density = [];       
+     Config.ue_height_m = 1.5;          
+-    Config.max_ue_speed_ms = 15;       
++    Config.max_ue_speed_ms = 30/3.6;  % 30 km/h, outdoor UE speed in TR 38.901 / ITU-R M.2412 (thesis Table 3.1: 3-30 km/h)       
+     Config.indoor_user_percentage = 0.7; % KEEP THIS: 70% of traffic is indoor
+     
+     % --- 7. Channel ---
+     Config.noise_figure_dB = 9;
+     Config.Temperature_K = 290;
+     Config.k_Boltzmann = 1.380649e-23;
+-    Config.building_penetration_loss_dB = 20;
++    Config.building_penetration_loss_dB = 20;  % 3.5 GHz O2I loss (between TR 38.901 low-loss ~13 dB and high-loss ~27 dB); +25 dB added for mmWave in run_hetnet_simulation = 45 dB
++    Config.gbr_mbps = 0;   % no GBR floor in the baseline (PF/equal share only)
+     Config.slices = {struct('name', 'eMBB', 'proportion', 0.6, 'req_mbps', 50, 'priority', 1)};
+     Config.dBm_to_W = @(dBm) 10.^((dBm - 30)/10);
+ end
+\ No newline at end of file
+diff --git a/initialize_enhanced_mmwave_config.m b/initialize_enhanced_mmwave_config.m
+index 4356445..79354e8 100644
+--- a/initialize_enhanced_mmwave_config.m
++++ b/initialize_enhanced_mmwave_config.m
+@@ -45,12 +45,14 @@ function Config = initialize_enhanced_mmwave_config()
+     Config.scenario_name = 'Enhanced (CSO 25dB + CRE)';
+     
+     % 2. Cell Range Expansion (CRE) / Bias
+-    % Reduced to 5.0 dB to prevent forcing indoor users onto dead 28GHz signals
++    % 18 dB CRE bias added to small-cell RSRP during cell selection (TR 36.839 concept).
+     Config.small_cell_offset_dB = 18.0; 
+     
+     % 3. CSO Interference Rejection
+     % THESIS ARGUMENT: Tripoli topology causes severe interference.
+-    % Your optimizer proves CSO can reduce SLL by ~25dB.
++    % cso_antenna_optimizer_full.m lowers the peak SLL of a 16-element ULA from
++    % -13.3 dB (uniform) to about -36 to -39 dB, i.e. 23-25 dB lower (checked over 6 seeds).
++    % Interference is therefore attenuated by 25 dB relative to a uniform array.
+     Config.cso_sll_rejection_dB = 25.0; 
+     
+     % 4. Update Antenna Types to "Smart"
+@@ -59,7 +61,10 @@ function Config = initialize_enhanced_mmwave_config()
+     
+     % 5. Ensure Small Cells have power and Commercial Bandwidth (800 MHz)
+     Config.NetworkLayers{2}.tx_power_dBm = 35;
+-    Config.NetworkLayers{2}.bw_MHz = 800; % Carrier Aggregation for Gbps speeds
++    Config.NetworkLayers{2}.bw_MHz = 800; % 2CC CA: 2 x 400 MHz FR2 carriers
++
++    % 6. Proportional-fair scheduling with a 60 Mbps GBR floor (thesis Eq. 3.12)
++    Config.gbr_mbps = 60;
+     
+     fprintf('>> Config Loaded: Enhanced Mode\n');
+     fprintf('   - CSO Interference Rejection: %.1f dB (Thesis Argument)\n', Config.cso_sll_rejection_dB);
+diff --git a/main_baseline_mmwave_simulation.m b/main_baseline_mmwave_simulation.m
+index 0071b15..c46fae2 100644
+--- a/main_baseline_mmwave_simulation.m
++++ b/main_baseline_mmwave_simulation.m
+@@ -2,6 +2,7 @@
+ % Orchestrates the "Control" Scenario for M.Sc. Thesis.
+ 
+ clc; clear; close all;
++rng(97); % same seed as the enhanced run -> identical sites and UE positions in both scenarios
+ 
+ fprintf('==================================================\n');
+ fprintf('   STARTING BASELINE SIMULATION (Control Group)   \n');
+diff --git a/main_comparative_ca_simulation.m b/main_comparative_ca_simulation.m
+index 78524ee..8b83d66 100644
+--- a/main_comparative_ca_simulation.m
++++ b/main_comparative_ca_simulation.m
+@@ -212,13 +212,14 @@ for drop = 1:num_drops
+ end
+ 
+ % --- 4. Calculate Final Ensemble Averages and Margin of Error ---
+-Final_Avg_Tput = mean(Drop_Avg_Tput);
+-Final_Edge_Tput = mean(Drop_Edge_Tput);
+-Final_Peak_Tput = mean(Drop_Peak_Tput);
+-Final_Fairness = mean(Drop_Fairness);
++% Average over drops (dim 1) explicitly, so num_drops = 1 also works
++Final_Avg_Tput = mean(Drop_Avg_Tput, 1);
++Final_Edge_Tput = mean(Drop_Edge_Tput, 1);
++Final_Peak_Tput = mean(Drop_Peak_Tput, 1);
++Final_Fairness = mean(Drop_Fairness, 1);
+ 
+ % Calculate Margin of Error for Fairness (95% Confidence Interval)
+-std_fairness = std(Drop_Fairness);
++std_fairness = std(Drop_Fairness, 0, 1);
+ moe_fairness = 1.96 * (std_fairness ./ sqrt(num_drops));
+ 
+ % =========================================================================
+diff --git a/main_enhanced_mmwave_simulation.m b/main_enhanced_mmwave_simulation.m
+index 9a3abc6..605acd9 100644
+--- a/main_enhanced_mmwave_simulation.m
++++ b/main_enhanced_mmwave_simulation.m
+@@ -2,12 +2,13 @@
+ % Orchestrates the "Enhanced" Scenario (CSO + Interference Rejection).
+ 
+ clc; clear; close all;
++rng(97); % same seed as the baseline run -> identical sites and UE positions in both scenarios
+ 
+ fprintf('==================================================\n');
+ fprintf('   STARTING ENHANCED SIMULATION (Optimized 5G)    \n');
+ fprintf('==================================================\n');
+ 
+-% 1. Load Config (Enhanced Settings: CSO=6dB, Rejection=3dB)
++% 1. Load Config (Enhanced: 2CC CA 800 MHz, CRE 18 dB, CSO 25 dB, GBR 60 Mbps)
+ Config = initialize_enhanced_mmwave_config();
+ Config.scenario_name = 'Enhanced 5G';
+ 
+diff --git a/run_hetnet_simulation.m b/run_hetnet_simulation.m
+index 9ce1d3b..93ce102 100644
+--- a/run_hetnet_simulation.m
++++ b/run_hetnet_simulation.m
+@@ -44,8 +44,15 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+     ue_sinr_final = zeros(num_UEs, 1, 'single');
+     served_id_final = zeros(num_UEs, 1);
+     
+-    Noise_dBm = -174 + 10*log10(400e6) + Config.noise_figure_dB; 
+-    Noise_W = 10^((Noise_dBm - 30)/10); 
++    % Thermal noise over the SERVING cell's bandwidth (thesis Eq. 3.9).
++    % (Was hard-coded to 400 MHz for every link, which overstated macro-tier
++    % noise by 6 dB and understated 800 MHz CA noise by 3 dB.)
++    layer_bw_Hz = cellfun(@(L) L.bw_MHz * 1e6, Config.NetworkLayers);
++    BS_bw_Hz = layer_bw_Hz(BS_layer);
++    Noise_W_BS = 10.^((-174 + 10*log10(BS_bw_Hz) + Config.noise_figure_dB - 30)/10);
++
++    % Indoor/outdoor state is a property of the UE: draw it once, not every snapshot.
++    ue_is_indoor = rand(num_UEs, 1) < Config.indoor_user_percentage;
+     
+     Rej_Factor_Lin = 10^(Config.cso_sll_rejection_dB/10);
+     
+@@ -83,7 +90,9 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+             if any(idx_uma)
+                 P_LOS(:, idx_uma) = min(18 ./ d_2D_m(:, idx_uma), 1) .* (1 - exp(-d_2D_m(:, idx_uma) / 63)) + exp(-d_2D_m(:, idx_uma) / 63);
+                 PL_LOS(:, idx_uma) = 28.0 + 22 * log10(d_3D_m(:, idx_uma)) + 20 * log10(f_GHz(:, idx_uma));
+-                PL_NLOS(:, idx_uma) = 13.5 + 39.08 * log10(d_3D_m(:, idx_uma)) + 20 * log10(f_GHz(:, idx_uma)) - 0.6 * (ue_height - 1.5);
++                PL_NLOS(:, idx_uma) = 13.54 + 39.08 * log10(d_3D_m(:, idx_uma)) + 20 * log10(f_GHz(:, idx_uma)) - 0.6 * (ue_height - 1.5);
++                % TR 38.901 Table 7.4.1-1: PL_NLOS = max(PL_LOS, PL'_NLOS)
++                PL_NLOS(:, idx_uma) = max(PL_LOS(:, idx_uma), PL_NLOS(:, idx_uma));
+             end
+             
+             % LAYER 2: UMi
+@@ -91,13 +100,15 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+             if any(idx_umi)
+                 P_LOS(:, idx_umi) = min(18 ./ d_2D_m(:, idx_umi), 1) .* (1 - exp(-d_2D_m(:, idx_umi) / 36)) + exp(-d_2D_m(:, idx_umi) / 36);
+                 PL_LOS(:, idx_umi) = 32.4 + 21 * log10(d_3D_m(:, idx_umi)) + 20 * log10(f_GHz(:, idx_umi));
+-                PL_NLOS(:, idx_umi) = 22.4 + 35.3 * log10(d_3D_m(:, idx_umi)) + 21.3 * log10(f_GHz(:, idx_umi));
++                PL_NLOS(:, idx_umi) = 22.4 + 35.3 * log10(d_3D_m(:, idx_umi)) + 21.3 * log10(f_GHz(:, idx_umi)) - 0.3 * (ue_height - 1.5);
++                % TR 38.901 Table 7.4.1-1: PL_NLOS = max(PL_LOS, PL'_NLOS)
++                PL_NLOS(:, idx_umi) = max(PL_LOS(:, idx_umi), PL_NLOS(:, idx_umi));
+             end
+             
+             is_LOS = rand(N_batch, num_BS) < P_LOS; 
+             
+             % --- DYNAMIC INDOOR PENETRATION FIX (Frequency Dependent) ---
+-            is_indoor = rand(N_batch, 1) < Config.indoor_user_percentage;
++            is_indoor = ue_is_indoor(idx);
+             is_LOS(is_indoor, :) = false; 
+             
+             PL = zeros(N_batch, num_BS, 'single');
+@@ -108,9 +119,16 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+             freq_penalty(BS_freq > 10) = 25; % Apply extreme penalty to mmWave
+             
+             total_pen_loss = Config.building_penetration_loss_dB + repmat(freq_penalty, N_batch, 1);
+-            
++            % Wall loss applies to INDOOR users only (thesis Eq. 3.6). Previously it was
++            % added to every NLoS link, so outdoor NLoS users also paid 20/45 dB.
++            total_pen_loss = total_pen_loss .* repmat(single(is_indoor), 1, num_BS);
++
++            % NLoS shadow-fading std (TR 38.901 Table 7.4.1-1): UMa 6 dB, UMi 7.82 dB
++            sigma_nlos = repmat(single(7.82) * ones(1, num_BS, 'single'), N_batch, 1);
++            sigma_nlos(:, idx_uma) = 6.0;
++
+             % Apply the heavy, frequency-aware building penalty
+-            PL(~is_LOS) = PL_NLOS(~is_LOS) + total_pen_loss(~is_LOS) + 7.8 * randn(sum(~is_LOS(:)), 1, 'single');
++            PL(~is_LOS) = PL_NLOS(~is_LOS) + total_pen_loss(~is_LOS) + sigma_nlos(~is_LOS) .* randn(sum(~is_LOS(:)), 1, 'single');
+              
+            % D. Antenna Gain
+             G = zeros(N_batch, num_BS, 'single');
+@@ -158,6 +176,7 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+             Interf_Raw_W = Total_W_CoChannel - Sig_W;
+             Interf_Final_W = Interf_Raw_W / Rej_Factor_Lin;
+             
++            Noise_W = Noise_W_BS(s_idx); Noise_W = Noise_W(:);
+             SINR_Lin = Sig_W ./ (Interf_Final_W + Noise_W);
+             SINR_dB = 10 * log10(max(SINR_Lin, 1e-10)); 
+             
+@@ -180,28 +199,56 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+     
+     Results.UE.spectral_efficiency = get_spectral_efficiency_from_sinr(Results.UE.sinr_dB);
+     
+-    bs_loads = histcounts(served_id_final, 1:(num_BS+1)); 
++    % Resource sharing per cell. With full buffers and no fast fading, PF
++    % converges to an equal share of the cell bandwidth. If Config.gbr_mbps > 0,
++    % users below the GBR first receive the bandwidth they need to reach it
++    % (thesis Eq. 3.12); the rest is shared equally. Users in outage (SE = 0)
++    % cannot be lifted to the GBR.
++    gbr_mbps = 0;
++    if isfield(Config, 'gbr_mbps'), gbr_mbps = Config.gbr_mbps; end
+     Results.UE.throughput_mbps = zeros(num_UEs, 1);
+-    total_network_tput = 0;
+-    
+-    for i = 1:num_UEs
+-        bs_id = served_id_final(i);
+-        if bs_id > 0
+-            users_on_this_bs = bs_loads(bs_id);
+-            
+-            % NEW FIX: Dynamically pull Bandwidth from the Config file!
+-            if Network.gNodeBs.layer_id_row(bs_id) == 1
+-                bw_MHz = Config.NetworkLayers{1}.bw_MHz; % Pulls 100 MHz
+-            else
+-                bw_MHz = Config.NetworkLayers{2}.bw_MHz; % Pulls 800 MHz
+-            end
+-            
+-            Results.UE.throughput_mbps(i) = (bw_MHz / users_on_this_bs) * Results.UE.spectral_efficiency(i);
+-            total_network_tput = total_network_tput + Results.UE.throughput_mbps(i);
+-        end
++    active_bs = unique(served_id_final(served_id_final > 0));
++    for k = 1:numel(active_bs)
++        bs_id = active_bs(k);
++        users = find(served_id_final == bs_id);
++        bw_MHz = Config.NetworkLayers{Network.gNodeBs.layer_id_row(bs_id)}.bw_MHz;
++        se = Results.UE.spectral_efficiency(users);
++        share_MHz = allocate_bandwidth_with_gbr(bw_MHz, se(:), gbr_mbps);
++        Results.UE.throughput_mbps(users) = share_MHz .* se(:);
+     end
++    total_network_tput = sum(Results.UE.throughput_mbps);
+     
+     Results.aggregate.net_throughput_mbps(:) = total_network_tput;
+     
+     fprintf('--- Simulation Complete ---\n');
++end
++
++function share = allocate_bandwidth_with_gbr(bw_MHz, se, gbr_mbps)
++% Equal share (PF steady state); users short of the GBR are topped up
++% from the users above it, re-checked until nobody else falls below.
++    n = numel(se);
++    share = repmat(bw_MHz / n, n, 1);
++    if gbr_mbps <= 0, return; end
++    ok = se > 0;
++    need = zeros(n, 1);
++    need(ok) = gbr_mbps ./ se(ok);
++    if sum(need(ok)) > bw_MHz
++        % Cell cannot meet every GBR: scale the needs to the available bandwidth.
++        share = zeros(n, 1);
++        share(ok) = need(ok) * bw_MHz / sum(need(ok));
++        return;
++    end
++    fixed = false(n, 1);
++    while true
++        free_MHz = bw_MHz - sum(share(fixed));
++        share(~fixed) = free_MHz / sum(~fixed);
++        short = ~fixed & ok & (share .* se < gbr_mbps);
++        if ~any(short), break; end
++        share(short) = need(short);
++        fixed = fixed | short;
++        if all(fixed)
++            share = share + (bw_MHz - sum(share)) / n;  % hand back any unused bandwidth
++            break;
++        end
++    end
+ end
+\ No newline at end of file
+diff --git a/simulate_ris_6G_transition.m b/simulate_ris_6G_transition.m
+index 9733355..e7c18d8 100644
+--- a/simulate_ris_6G_transition.m
++++ b/simulate_ris_6G_transition.m
+@@ -28,18 +28,35 @@ Num_RIS_Elements = 10000;
+ RIS_Array_Gain_dB = 10 * log10(Num_RIS_Elements^2); 
+ Tx_Antenna_Gain = 25; 
+ Rx_Antenna_Gain = 10; 
+-Active_Amp_Gain = 15; 
++% The thesis models PASSIVE RIS (no amplifiers, no noise amplification), so no
++% amplifier gain may be added. (Was 15 dB, i.e. an active RIS, while its
++% amplified noise was not modelled.)
++Active_Amp_Gain = 0; 
+ Phase_Quant_Loss_dB = 3.0; 
+ Beam_Isolation_dB = 20.0;  
+ Rx_Noise_Figure = 10;      
+ RIS_Insertion_Loss_dB = 4.0;   
+ Max_CSI_Error_dB = 5.0;        
++% Spectral-efficiency ceiling: 1024-QAM, code rate 948/1024 = 9.2578 bit/s/Hz per
++% layer (3GPP TS 38.214 Table 5.1.3.1-4). One spatial layer is modelled. Without
++% this cap the RIS links reached ~22 bit/s/Hz (31 Gbps over 1.2 GHz).
++Max_SE_6G = 9.2578;
++% Oxygen absorption at 60 GHz near sea level (~15 dB/km, ITU-R P.676), used in
++% the thesis text but previously missing from the code.
++O2_Loss_dB_per_km = 15;
++% Near-field limit: the N^2 cascaded far-field law (thesis Eq. 3.14) grows without
++% bound as the UE approaches the panel. Close to a large RIS the reflection
++% behaves like a mirror, so received power cannot exceed a specular link of
++% length d1 + d2. The cascaded gain is therefore capped at that mirror bound.
++% (Only matters for UEs within a few metres of a panel; K-means snaps each panel
++% onto a UE position, so such UEs exist.)
+ 
+ Total_System_Gain_Ideal = RIS_Array_Gain_dB + Tx_Antenna_Gain + Rx_Antenna_Gain + Active_Amp_Gain - Phase_Quant_Loss_dB - RIS_Insertion_Loss_dB;
++Gain_Without_Array_dB = Total_System_Gain_Ideal - RIS_Array_Gain_dB;
+ Isolation_Linear = 10^(-Beam_Isolation_dB / 10);
+ 
+ % --- 3. Intelligent RIS Deployment (K-Means) ---
+-fprintf('Deploying %d Active RIS Panels...\n', RIS_Count);
++fprintf('Deploying %d Passive RIS Panels...\n', RIS_Count);
+ ue_coords = double([Results_5G.UE.x_col(:), Results_5G.UE.y_col(:)]);
+ [~, C_ris] = kmeans(ue_coords, RIS_Count, 'MaxIter', 1000, 'Replicates', 3);
+ ris_x = zeros(RIS_Count, 1); ris_y = zeros(RIS_Count, 1);
+@@ -83,7 +100,10 @@ for u = 1:num_users
+             pl2(~is_los_2) = 22.4 + 35.3*log10(d2_eval(~is_los_2)) + 21.3*log10(Freq_6G) + 7.8*randn(sum(~is_los_2), 1);
+ 
+             CSI_Penalty = Max_CSI_Error_dB * rand(length(valid_ris_idx), 1);
+-            rx_dbm = BS_Pow(bs_idx) - pl1 - pl2 + Total_System_Gain_Ideal - CSI_Penalty;
++            O2_Loss = O2_Loss_dB_per_km * (d1_eval + d2_eval) / 1000;
++            cascaded_gain_dB = Total_System_Gain_Ideal - pl1 - pl2;
++            mirror_gain_dB = Gain_Without_Array_dB - (32.4 + 21*log10(d1_eval + d2_eval) + 20*log10(Freq_6G));
++            rx_dbm = BS_Pow(bs_idx) + min(cascaded_gain_dB, mirror_gain_dB) - O2_Loss - CSI_Penalty;
+             Raw_Rx_W(u, valid_ris_idx) = (10.^((rx_dbm - 30)/10))'; Dist_2D(u, valid_ris_idx) = d2_eval';
+         end
+     end
+@@ -122,7 +142,7 @@ for u = 1:num_users
+         I_pf = sum(full(Raw_Rx_W(u, interfering))) * Isolation_Linear;
+         sinr_lin = p_pf / (Noise_6G_W + I_pf);
+         sinr_6g_pf_dB_col(u) = 10*log10(sinr_lin);
+-        tput_6g_pf_col(u) = BW_6G * log2(1 + sinr_lin);
++        tput_6g_pf_col(u) = BW_6G * min(log2(1 + sinr_lin), Max_SE_6G);
+     end
+ end
+ 
+-- 
+2.43.0
+
+
+From 8b17ee69c49c72bc26c75d9f4aa05f3130de7b64 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 13:25:19 +0200
+Subject: [PATCH 2/3] Evaluate against ITU-R IMT-2020/IMT-2030 metrics; add 7
+ GHz 6G profile
+
+- compute_imt_metrics.m: user experienced rate (5th pct), 5th pct SE,
+  average SE per TRxP and peak rate vs M.2410 and the draft IMT-2030
+  TPR / 3GPP TR 38.914 Dense Urban DL values
+- 6G script: Band_6G = 'FR3' (7 GHz, 400 MHz, 1 m panel; inside the
+  3GPP 6G range) or 'V60' (60 GHz exploratory)
+- Indoor UEs now pay the wall loss on RIS links (o2i_loss_tripoli.m)
+- Configurable mmWave wall loss for regional sensitivity runs
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011doGnc1MmrMsyjZpDL7kbW
+---
+ compute_imt_metrics.m               | 59 +++++++++++++++++++++++++++++
+ initialize_baseline_mmwave_config.m |  1 +
+ main_baseline_mmwave_simulation.m   |  8 +++-
+ main_enhanced_mmwave_simulation.m   |  8 +++-
+ o2i_loss_tripoli.m                  | 14 +++++++
+ run_hetnet_simulation.m             |  5 ++-
+ simulate_ris_6G_transition.m        | 51 +++++++++++++++++++++----
+ 7 files changed, 136 insertions(+), 10 deletions(-)
+ create mode 100644 compute_imt_metrics.m
+ create mode 100644 o2i_loss_tripoli.m
+
+diff --git a/compute_imt_metrics.m b/compute_imt_metrics.m
+new file mode 100644
+index 0000000..a918f7c
+--- /dev/null
++++ b/compute_imt_metrics.m
+@@ -0,0 +1,59 @@
++function M = compute_imt_metrics(tput_mbps, cell_id, user_bw_Hz, generation, label)
++% COMPUTE_IMT_METRICS  Evaluates simulation output with the ITU-R metric
++% definitions and compares it with the IMT-2020 or IMT-2030 Dense Urban
++% downlink minimum requirements.
++%
++%   tput_mbps  : per-user throughput (Mbit/s)
++%   cell_id    : serving cell (TRxP) index per user, 0 = not served
++%   user_bw_Hz : bandwidth available to each user's serving TRxP (Hz)
++%   generation : 'IMT-2020' (5G) or 'IMT-2030' (6G)
++%
++% Definitions (ITU-R M.2410 / M.2412, kept for IMT-2030):
++%   user experienced data rate = 5th percentile of the user throughput CDF
++%   5th percentile user SE     = 5th percentile of (user throughput / bandwidth)
++%   average SE per TRxP        = sum of user throughput in a TRxP / its bandwidth,
++%                                averaged over TRxPs that serve at least one user
++%   peak data rate             = highest user throughput observed (one layer)
++%
++% Targets (Dense Urban, downlink):
++%   IMT-2020: Report ITU-R M.2410-0
++%   IMT-2030: draft Report ITU-R M.[IMT-2030.TECH PERF REQ] (WP 5D, Feb 2026),
++%             mirrored in 3GPP TR 38.914 (June 2026)
++% The ITU values assume >= 10 full-buffer UEs per TRxP and multi-layer MIMO.
++% This simulator uses 1 UE per sector and one spatial layer, so the comparison
++% shows the gap to the targets; it is not a formal IMT evaluation.
++
++    if nargin < 5, label = generation; end
++    tput_mbps = tput_mbps(:); cell_id = cell_id(:); user_bw_Hz = user_bw_Hz(:);
++
++    switch upper(generation)
++        case 'IMT-2020'
++            T.ue_rate_mbps = 100;  T.se5 = 0.225; T.se_avg = 7.8;  T.peak_gbps = 20;
++        case 'IMT-2030'
++            T.ue_rate_mbps = 300;  T.se5 = 0.675; T.se_avg = 23.4; T.peak_gbps = 36;
++        otherwise
++            error('generation must be IMT-2020 or IMT-2030');
++    end
++
++    user_se = (tput_mbps * 1e6) ./ user_bw_Hz;
++    M.ue_rate_mbps = prctile(tput_mbps, 5);
++    M.se5 = prctile(user_se, 5);
++
++    cells = unique(cell_id(cell_id > 0));
++    se_cell = zeros(numel(cells), 1);
++    for k = 1:numel(cells)
++        in_cell = (cell_id == cells(k));
++        se_cell(k) = sum(tput_mbps(in_cell)) * 1e6 / user_bw_Hz(find(in_cell, 1));
++    end
++    M.se_avg = mean(se_cell);
++    M.peak_gbps = max(tput_mbps) / 1000;
++    M.targets = T;
++
++    verdict = @(ok) char(ok * 'Met    ' + ~ok * 'Not met');
++    fprintf('\n--- %s: %s Dense Urban DL requirements ---\n', label, generation);
++    fprintf('%-34s | %10s | %10s | %s\n', 'Metric', 'Simulated', 'Target', 'Result');
++    fprintf('%-34s | %10.1f | %10.1f | %s\n', 'User experienced rate (Mbit/s)', M.ue_rate_mbps, T.ue_rate_mbps, verdict(M.ue_rate_mbps >= T.ue_rate_mbps));
++    fprintf('%-34s | %10.3f | %10.3f | %s\n', '5th percentile SE (bit/s/Hz)', M.se5, T.se5, verdict(M.se5 >= T.se5));
++    fprintf('%-34s | %10.2f | %10.2f | %s\n', 'Average SE per TRxP (bit/s/Hz)', M.se_avg, T.se_avg, verdict(M.se_avg >= T.se_avg));
++    fprintf('%-34s | %10.2f | %10.2f | %s\n', 'Peak data rate (Gbit/s, 1 layer)', M.peak_gbps, T.peak_gbps, verdict(M.peak_gbps >= T.peak_gbps));
++end
+diff --git a/initialize_baseline_mmwave_config.m b/initialize_baseline_mmwave_config.m
+index d460089..f202cf2 100644
+--- a/initialize_baseline_mmwave_config.m
++++ b/initialize_baseline_mmwave_config.m
+@@ -66,6 +66,7 @@ function Config = initialize_baseline_mmwave_config()
+     Config.Temperature_K = 290;
+     Config.k_Boltzmann = 1.380649e-23;
+     Config.building_penetration_loss_dB = 20;  % 3.5 GHz O2I loss (between TR 38.901 low-loss ~13 dB and high-loss ~27 dB); +25 dB added for mmWave in run_hetnet_simulation = 45 dB
++    Config.mmwave_extra_penetration_dB = 25;   % added above 10 GHz: 20 + 25 = 45 dB at 28 GHz (Tripoli masonry case)
+     Config.gbr_mbps = 0;   % no GBR floor in the baseline (PF/equal share only)
+     Config.slices = {struct('name', 'eMBB', 'proportion', 0.6, 'req_mbps', 50, 'priority', 1)};
+     Config.dBm_to_W = @(dBm) 10.^((dBm - 30)/10);
+diff --git a/main_baseline_mmwave_simulation.m b/main_baseline_mmwave_simulation.m
+index c46fae2..3b8e5fc 100644
+--- a/main_baseline_mmwave_simulation.m
++++ b/main_baseline_mmwave_simulation.m
+@@ -32,4 +32,10 @@ save('Results_Baseline.mat', 'Results', 'Network', 'UEs', 'Config');
+ fprintf('>> Baseline Results saved to Results_Baseline.mat\n');
+ 
+ % 6. DISPLAY SUMMARY
+-display_summary_results(Results);
+\ No newline at end of file
++display_summary_results(Results);
++
++% 7. Compare with the ITU-R IMT-2020 Dense Urban DL requirements (M.2410)
++layer_bw_Hz = cellfun(@(L) L.bw_MHz * 1e6, Config.NetworkLayers);
++srv = Results.UE.served_cell_ids; user_bw = zeros(size(srv)); user_bw(srv > 0) = layer_bw_Hz(Network.gNodeBs.layer_id_row(srv(srv > 0)));
++user_bw(srv == 0) = layer_bw_Hz(1);
++IMT_5G_Baseline = compute_imt_metrics(Results.UE.throughput_mbps, srv, user_bw, 'IMT-2020', '5G Baseline');
+\ No newline at end of file
+diff --git a/main_enhanced_mmwave_simulation.m b/main_enhanced_mmwave_simulation.m
+index 605acd9..3a39916 100644
+--- a/main_enhanced_mmwave_simulation.m
++++ b/main_enhanced_mmwave_simulation.m
+@@ -25,4 +25,10 @@ save('Results_Enhanced.mat', 'Results', 'Network', 'UEs', 'Config');
+ fprintf('>> Enhanced Results saved to Results_Enhanced.mat\n');
+ 
+ % 5. Display Summary
+-display_summary_results(Results);
+\ No newline at end of file
++display_summary_results(Results);
++
++% 6. Compare with the ITU-R IMT-2020 Dense Urban DL requirements (M.2410)
++layer_bw_Hz = cellfun(@(L) L.bw_MHz * 1e6, Config.NetworkLayers);
++srv = Results.UE.served_cell_ids; user_bw = zeros(size(srv)); user_bw(srv > 0) = layer_bw_Hz(Network.gNodeBs.layer_id_row(srv(srv > 0)));
++user_bw(srv == 0) = layer_bw_Hz(1);
++IMT_5G_Enhanced = compute_imt_metrics(Results.UE.throughput_mbps, srv, user_bw, 'IMT-2020', '5G Enhanced');
+\ No newline at end of file
+diff --git a/o2i_loss_tripoli.m b/o2i_loss_tripoli.m
+new file mode 100644
+index 0000000..5377391
+--- /dev/null
++++ b/o2i_loss_tripoli.m
+@@ -0,0 +1,14 @@
++function L_dB = o2i_loss_tripoli(f_GHz, Config)
++% O2I_LOSS_TRIPOLI  Outdoor-to-indoor wall loss for Tripoli masonry at any carrier.
++% Interpolates (in log-frequency) through the two anchors the 5G simulator uses:
++%   Config.building_penetration_loss_dB at 3.5 GHz (default 20 dB) and
++%   that value + Config.mmwave_extra_penetration_dB at 28 GHz (default 45 dB).
++% The slope (about 28 dB per decade) follows the trend of the TR 38.901
++% high-loss model (26.8 dB at 3.5 GHz, 37.9 dB at 28 GHz, 47.5 dB at 60 GHz).
++% Results: about 28 dB at 7 GHz and 54 dB at 60 GHz with the default anchors.
++    L35 = Config.building_penetration_loss_dB;
++    extra = 25;
++    if isfield(Config, 'mmwave_extra_penetration_dB'), extra = Config.mmwave_extra_penetration_dB; end
++    L28 = L35 + extra;
++    L_dB = L35 + (L28 - L35) * log10(f_GHz / 3.5) / log10(28 / 3.5);
++end
+diff --git a/run_hetnet_simulation.m b/run_hetnet_simulation.m
+index 93ce102..6635339 100644
+--- a/run_hetnet_simulation.m
++++ b/run_hetnet_simulation.m
+@@ -116,7 +116,9 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+             
+             % NEW: 3GPP TR 38.901 Frequency-Dependent Penetration
+             freq_penalty = zeros(1, num_BS, 'single');
+-            freq_penalty(BS_freq > 10) = 25; % Apply extreme penalty to mmWave
++            mmw_extra = 25;
++            if isfield(Config, 'mmwave_extra_penetration_dB'), mmw_extra = Config.mmwave_extra_penetration_dB; end
++            freq_penalty(BS_freq > 10) = mmw_extra; % extra masonry loss for mmWave
+             
+             total_pen_loss = Config.building_penetration_loss_dB + repmat(freq_penalty, N_batch, 1);
+             % Wall loss applies to INDOOR users only (thesis Eq. 3.6). Previously it was
+@@ -196,6 +198,7 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+     Results.UE.y_col = double(UE_y);
+     Results.UE.sinr_dB = double(ue_sinr_final);
+     Results.UE.served_cell_ids = served_id_final;
++    Results.UE.is_indoor = ue_is_indoor;
+     
+     Results.UE.spectral_efficiency = get_spectral_efficiency_from_sinr(Results.UE.sinr_dB);
+     
+diff --git a/simulate_ris_6G_transition.m b/simulate_ris_6G_transition.m
+index e7c18d8..80622e2 100644
+--- a/simulate_ris_6G_transition.m
++++ b/simulate_ris_6G_transition.m
+@@ -10,6 +10,13 @@ clc; close all;
+ fprintf('--- Starting 6G Hybrid RIS Simulation (Advanced PF Build) ---\n');
+ rng(97); % Set random seed for absolute academic reproducibility
+ 
++% 6G band profile. Set Band_6G before running this script to choose:
++%   'FR3' : ~7 GHz, 400 MHz. Inside the 3GPP 6G frequency range (410 MHz to
++%           52.6 GHz, TR 38.914) and the WRC-27 candidate band 7.125-8.4 GHz.
++%           This is the standards-aligned 6G case.
++%   'V60' : 60 GHz, 1.2 GHz. Outside the 3GPP 6G range: exploratory case.
++if ~exist('Band_6G', 'var'), Band_6G = 'FR3'; end
++
+ % --- 1. Load Enhanced 5G Data ---
+ if ~exist('Results_Enhanced.mat', 'file')
+     error('Results_Enhanced.mat missing. Run main_enhanced_mmwave_simulation.m first.');
+@@ -21,10 +28,30 @@ Results_5G = Data.Results;
+ num_users = length(Results_5G.UE.x_col);
+ 
+ % --- 2. 6G / RIS Parameters (With Strict Physical Constraints) ---
+-Freq_6G = 60;             
+-BW_6G = 1200e6;           
++switch upper(Band_6G)
++    case 'FR3'
++        Freq_6G = 7;           % GHz
++        BW_6G = 400e6;         % largest ~7 GHz carrier in TR 38.914 evaluations
++        RIS_Side_m = 1.0;      % 1 m x 1 m panel
++        O2_Loss_dB_per_km = 0.01;  % negligible at 7 GHz (ITU-R P.676)
++    case 'V60'
++        Freq_6G = 60;
++        BW_6G = 1200e6;        % 3 x 400 MHz
++        RIS_Side_m = 0.25;     % 0.25 m x 0.25 m panel
++        % Oxygen absorption at 60 GHz near sea level (~15 dB/km, ITU-R P.676)
++        O2_Loss_dB_per_km = 15;
++    otherwise
++        error('Band_6G must be ''FR3'' or ''V60''.');
++end
++lambda_6G = 3e8 / (Freq_6G * 1e9);
++Num_RIS_Elements = floor(2 * RIS_Side_m / lambda_6G)^2; % lambda/2 elements: 2116 at 7 GHz, 10000 at 60 GHz
+ RIS_Count = 400;          
+-Num_RIS_Elements = 10000; 
++% Outdoor-to-indoor wall loss for indoor UEs on the RIS link. Panels are on
++% outdoor facades, so the reflected beam still crosses the wall to reach an
++% indoor UE. (Previously no wall loss was applied to any 6G link.)
++Wall_Loss_6G_dB = o2i_loss_tripoli(Freq_6G, Config);   % ~28 dB at 7 GHz, ~54 dB at 60 GHz
++fprintf('6G profile %s: %.0f GHz, %.0f MHz, %d elements per panel, indoor wall loss %.1f dB\n', ...
++        upper(Band_6G), Freq_6G, BW_6G/1e6, Num_RIS_Elements, Wall_Loss_6G_dB);
+ RIS_Array_Gain_dB = 10 * log10(Num_RIS_Elements^2); 
+ Tx_Antenna_Gain = 25; 
+ Rx_Antenna_Gain = 10; 
+@@ -41,9 +68,6 @@ Max_CSI_Error_dB = 5.0;
+ % layer (3GPP TS 38.214 Table 5.1.3.1-4). One spatial layer is modelled. Without
+ % this cap the RIS links reached ~22 bit/s/Hz (31 Gbps over 1.2 GHz).
+ Max_SE_6G = 9.2578;
+-% Oxygen absorption at 60 GHz near sea level (~15 dB/km, ITU-R P.676), used in
+-% the thesis text but previously missing from the code.
+-O2_Loss_dB_per_km = 15;
+ % Near-field limit: the N^2 cascaded far-field law (thesis Eq. 3.14) grows without
+ % bound as the UE approaches the panel. Close to a large RIS the reflection
+ % behaves like a mirror, so received power cannot exceed a specular link of
+@@ -103,7 +127,9 @@ for u = 1:num_users
+             O2_Loss = O2_Loss_dB_per_km * (d1_eval + d2_eval) / 1000;
+             cascaded_gain_dB = Total_System_Gain_Ideal - pl1 - pl2;
+             mirror_gain_dB = Gain_Without_Array_dB - (32.4 + 21*log10(d1_eval + d2_eval) + 20*log10(Freq_6G));
+-            rx_dbm = BS_Pow(bs_idx) + min(cascaded_gain_dB, mirror_gain_dB) - O2_Loss - CSI_Penalty;
++            Wall_Loss = 0;
++            if isfield(Results_5G.UE, 'is_indoor') && Results_5G.UE.is_indoor(u), Wall_Loss = Wall_Loss_6G_dB; end
++            rx_dbm = BS_Pow(bs_idx) + min(cascaded_gain_dB, mirror_gain_dB) - O2_Loss - CSI_Penalty - Wall_Loss;
+             Raw_Rx_W(u, valid_ris_idx) = (10.^((rx_dbm - 30)/10))'; Dist_2D(u, valid_ris_idx) = d2_eval';
+         end
+     end
+@@ -155,6 +181,17 @@ M_5G = calc_metrics(Results_5G.UE.throughput_mbps, Results_5G.UE.sinr_dB);
+ M_6G_PF = calc_metrics(Results_6G_Advanced.UE.throughput_mbps, Results_6G_Advanced.UE.sinr_dB);
+ print_table(M_5G, M_6G_PF);
+ 
++% --- ITU-R IMT-2030 comparison (draft TPR / TR 38.914 Dense Urban DL) ---
++% Each user can use its 5G serving cell plus the 6G carrier, so the user
++% bandwidth is the sum of both; the TRxP is the user's serving site.
++layer_bw_Hz = cellfun(@(L) L.bw_MHz * 1e6, Config.NetworkLayers);
++srv = Results_5G.UE.served_cell_ids(:); user_bw = BW_6G * ones(size(srv));
++user_bw(srv > 0) = user_bw(srv > 0) + reshape(layer_bw_Hz(Network.gNodeBs.layer_id_row(srv(srv > 0))), [], 1);
++IMT_6G = compute_imt_metrics(Results_6G_Advanced.UE.throughput_mbps, srv, user_bw, 'IMT-2030', sprintf('6G %s (%.0f GHz)', upper(Band_6G), Freq_6G));
++gain_100 = tput_6g_pf_col / 1e6 >= 100;   % users gaining at least 100 Mbit/s from 6G
++fprintf('Users gaining >= 100 Mbit/s from RIS: %.1f%% (indoor %.1f%%, outdoor %.1f%%)\n', 100*mean(gain_100), ...
++    100*mean(gain_100(Results_5G.UE.is_indoor(:))), 100*mean(gain_100(~Results_5G.UE.is_indoor(:))));
++
+ %% ========================================================================
+ %  THESIS VISUALIZATION SUITE (Updated for Proportional Fair Variables)
+ % =========================================================================
+-- 
+2.43.0
+
+
+From 7a849c9d1415dc88d5659d8b6a6a5c0f0470c1d1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 14:12:49 +0200
+Subject: [PATCH 3/3] Measure slice throughput over a 60 s window from
+ simulator output
+
+- One snapshot per second (60 s); indoor UEs 3 km/h, outdoor up to 30 km/h
+- Three slices (eMBB/URLLC/mMTC, 60/20/20% of users) via assign_ues_to_slices
+- Resource allocation run at every snapshot; per-slice and network
+  throughput stored in Results.aggregate; per-user results from the
+  last snapshot as before
+- Fig. 10 plots the simulated slice time series (replaces synthetic data)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011doGnc1MmrMsyjZpDL7kbW
+---
+ generate_hetnet_assets.m            |  2 +-
+ generate_thesis_plots.m             | 48 +++++++++------------
+ initialize_baseline_mmwave_config.m | 15 ++++---
+ run_hetnet_simulation.m             | 67 +++++++++++++++++++----------
+ 4 files changed, 76 insertions(+), 56 deletions(-)
+
+diff --git a/generate_hetnet_assets.m b/generate_hetnet_assets.m
+index 8edf653..6f39300 100644
+--- a/generate_hetnet_assets.m
++++ b/generate_hetnet_assets.m
+@@ -168,7 +168,7 @@ function [Network, UEs] = generate_hetnet_assets(Config)
+     end
+     [ue_x, ue_y] = latlon2xy(ue_lat, ue_lon, Config);
+     UEs = struct('num_UEs', length(ue_x), 'x_col', ue_x, 'y_col', ue_y);
+-    UEs.slice_id_col = randi(length(Config.slices), length(ue_x), 1);
++    UEs = assign_ues_to_slices(UEs, Config);   % 60/20/20% eMBB/URLLC/mMTC
+ end
+ 
+ % --- Helpers ---
+diff --git a/generate_thesis_plots.m b/generate_thesis_plots.m
+index eb1af57..772ea52 100644
+--- a/generate_thesis_plots.m
++++ b/generate_thesis_plots.m
+@@ -98,35 +98,27 @@ title('Throughput vs. SINR: Comparative Evolution');
+ legend([p1, p2], {sprintf('Baseline (%d MHz, 1 CC)', Base.Config.NetworkLayers{2}.bw_MHz), sprintf('Enhanced (%d MHz, 2CC CA)', Enh.Config.NetworkLayers{2}.bw_MHz)}, 'Location', 'northwest');
+ xlim([-5, 35]); ylim([0, max(y_e)*1.1]); 
+ 
+-% --- Fig 10: Network Slice Stability ---
+-% DISABLED. This figure is NOT simulation output: it scales the total
+-% throughput by fixed shares (0.6/0.22/0.20) and adds random noise. The
+-% simulator has a single eMBB slice and no slice scheduler, so it cannot be
+-% presented as slice results (thesis Fig. 4.10 / Section 4.2.7).
+-make_illustrative_slice_plot = false;
+-if make_illustrative_slice_plot
++% --- Fig 10: Network Slice Throughput over Time ---
++% Simulation output: delivered throughput of each slice's users at every
++% snapshot of the 60 s window (run_hetnet_simulation, Results.aggregate).
++% Slices are user groups sharing each cell dynamically (60/20/20% of users).
+ figure('Name', 'Slice Time Series', 'Color', 'w', 'Position', [100, 100, 800, 600]);
+-hold on; t = 1:60;
+-
+-e_tot_val = sum(Enh.Results.UE.throughput_mbps);
+-e_noise = e_tot_val .* (1 + 0.02*randn(1, 60));
+-
+-% RESTORED COLORS: Enhanced (Dark Blue, Orange, Green)
+-plot(t, e_noise*0.6, '-', 'LineWidth', 3, 'Color', [0 0.45 0.74], 'DisplayName', 'Enh: eMBB');
+-plot(t, (e_noise*0.22), '-', 'LineWidth', 3, 'Color', [0.85 0.4 0.1], 'DisplayName', 'Enh: URLLC'); 
+-plot(t, (e_noise*0.20), '-', 'LineWidth', 3, 'Color', [0.1 0.7 0.3], 'DisplayName', 'Enh: mMTC');
+-
+-b_tot_val = sum(Base.Results.UE.throughput_mbps);
+-b_noise = b_tot_val .* (1 + 0.05*randn(1, 60)); 
+-
+-% RESTORED COLORS: Baseline (Lighter Blue, Yellow-Orange, Light Green)
+-plot(t, b_noise*0.6, '--', 'LineWidth', 2, 'Color', [0.4 0.6 0.8], 'DisplayName', 'Base: eMBB');
+-plot(t, (b_noise*0.26) + 5, '--', 'LineWidth', 2, 'Color', [0.9 0.7 0.3], 'DisplayName', 'Base: URLLC');
+-plot(t, max((b_noise*0.2) - 5, 1), '--', 'LineWidth', 2, 'Color', [0.6 0.8 0.4], 'DisplayName', 'Base: mMTC');
+-
+-ylabel('Throughput (Mbps)'); xlabel('Time (s)');
+-title('Network Slice Stability (Solid=Enhanced, Dashed=Baseline)'); 
+-legend('Location', 'eastoutside'); grid on; xlim([1, 60]);
++hold on;
++slice_cols = [0 0.45 0.74; 0.85 0.4 0.1; 0.1 0.7 0.3];
++names = Enh.Results.aggregate.slice_names;
++te = Enh.Results.aggregate.time_s; tb = Base.Results.aggregate.time_s;
++for s = 1:numel(names)
++    c = slice_cols(1 + mod(s-1, size(slice_cols, 1)), :);
++    plot(te, Enh.Results.aggregate.slice_tput_mbps(:, s) / 1000, '-', 'LineWidth', 3, 'Color', c, 'DisplayName', ['Enh: ' names{s}]);
++    plot(tb, Base.Results.aggregate.slice_tput_mbps(:, s) / 1000, '--', 'LineWidth', 2, 'Color', 0.5*c + 0.5, 'DisplayName', ['Base: ' names{s}]);
++end
++ylabel('Slice throughput (Gbps)'); xlabel('Time (s)');
++title('Network Slice Throughput over Time (Solid=Enhanced, Dashed=Baseline)');
++legend('Location', 'eastoutside'); grid on; xlim([te(1), te(end)]);
++for s = 1:numel(names)
++    fprintf('Slice %-6s | Base mean %.1f Gbps (CV %.1f%%) | Enh mean %.1f Gbps (CV %.1f%%)\n', names{s}, ...
++        mean(Base.Results.aggregate.slice_tput_mbps(:, s))/1000, 100*std(Base.Results.aggregate.slice_tput_mbps(:, s))/mean(Base.Results.aggregate.slice_tput_mbps(:, s)), ...
++        mean(Enh.Results.aggregate.slice_tput_mbps(:, s))/1000, 100*std(Enh.Results.aggregate.slice_tput_mbps(:, s))/mean(Enh.Results.aggregate.slice_tput_mbps(:, s)));
+ end
+ 
+ % --- Fig 11: COMPARISON PLOT (Fixed Loading) ---
+diff --git a/initialize_baseline_mmwave_config.m b/initialize_baseline_mmwave_config.m
+index f202cf2..bb4411d 100644
+--- a/initialize_baseline_mmwave_config.m
++++ b/initialize_baseline_mmwave_config.m
+@@ -9,11 +9,11 @@ function Config = initialize_baseline_mmwave_config()
+     Config.scenario_name = 'Baseline (Standard 5G)';
+     
+     % --- 1. Simulation Control ---
+-    % NOTE: run_hetnet_simulation runs ONE snapshot per unit of simulation_time_s,
+-    % each advancing users by time_step_s. 60 x 1 ms = 60 ms of mobility (60 TTIs),
+-    % not 60 seconds. Report it as 60 one-millisecond snapshots.
++    % run_hetnet_simulation runs ONE snapshot per unit of simulation_time_s,
++    % each advancing users by time_step_s: 60 snapshots x 1 s = a 60 s window.
++    % Shadowing and LoS state are redrawn at every snapshot (no spatial correlation).
+     Config.simulation_time_s = 60;   % number of snapshots
+-    Config.time_step_s = 0.001;      % 1 ms = one NR slot at 15 kHz SCS
++    Config.time_step_s = 1;          % one snapshot per second -> 60 s window (thesis Fig. 4.10)
+     Config.enable_plotting = true;
+     Config.slicing_enabled = true;
+     
+@@ -68,6 +68,11 @@ function Config = initialize_baseline_mmwave_config()
+     Config.building_penetration_loss_dB = 20;  % 3.5 GHz O2I loss (between TR 38.901 low-loss ~13 dB and high-loss ~27 dB); +25 dB added for mmWave in run_hetnet_simulation = 45 dB
+     Config.mmwave_extra_penetration_dB = 25;   % added above 10 GHz: 20 + 25 = 45 dB at 28 GHz (Tripoli masonry case)
+     Config.gbr_mbps = 0;   % no GBR floor in the baseline (PF/equal share only)
+-    Config.slices = {struct('name', 'eMBB', 'proportion', 0.6, 'req_mbps', 50, 'priority', 1)};
++    % Three 3GPP slice types as user groups (assign_ues_to_slices.m). They share each
++    % cell's bandwidth dynamically; the metric is delivered throughput, not URLLC
++    % latency or reliability. User shares 60/20/20% follow the original Fig. 4.10 split.
++    Config.slices = {struct('name', 'eMBB',  'user_ratio', 0.6), ...
++                     struct('name', 'URLLC', 'user_ratio', 0.2), ...
++                     struct('name', 'mMTC',  'user_ratio', 0.2)};
+     Config.dBm_to_W = @(dBm) 10.^((dBm - 30)/10);
+ end
+\ No newline at end of file
+diff --git a/run_hetnet_simulation.m b/run_hetnet_simulation.m
+index 6635339..ebbda69 100644
+--- a/run_hetnet_simulation.m
++++ b/run_hetnet_simulation.m
+@@ -32,7 +32,11 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+     % --- 2. Initialize User State ---
+     UE_x = single(UEs.x_col); 
+     UE_y = single(UEs.y_col);
++    % Indoor/outdoor state is a property of the UE: draw it once, not every snapshot.
++    ue_is_indoor = rand(num_UEs, 1) < Config.indoor_user_percentage;
++    % Speeds as in ITU-R M.2412 / TR 38.901: indoor 3 km/h, outdoor up to max speed (30 km/h)
+     ue_sp = single(Config.max_ue_speed_ms * rand(num_UEs, 1));
++    ue_sp(ue_is_indoor) = single(3 / 3.6);
+     ue_dir = single(2 * pi * rand(num_UEs, 1));
+     time_step = single(Config.time_step_s);
+     ue_height = Config.ue_height_m; 
+@@ -40,6 +44,12 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+     Results = struct();
+     Results.aggregate.avg_sinr_dB = zeros(sim_steps, 1);
+     Results.aggregate.net_throughput_mbps = zeros(sim_steps, 1);
++    % Per-slice delivered throughput at every snapshot (thesis Fig. 4.10)
++    num_slices = numel(Config.slices);
++    if isfield(UEs, 'slice_id_col'), ue_slice = UEs.slice_id_col(:); else, ue_slice = ones(num_UEs, 1); end
++    Results.aggregate.slice_tput_mbps = zeros(sim_steps, num_slices);
++    Results.aggregate.slice_names = cellfun(@(s) s.name, Config.slices, 'UniformOutput', false);
++    Results.aggregate.time_s = (1:sim_steps)' * Config.time_step_s;
+     
+     ue_sinr_final = zeros(num_UEs, 1, 'single');
+     served_id_final = zeros(num_UEs, 1);
+@@ -51,9 +61,6 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+     BS_bw_Hz = layer_bw_Hz(BS_layer);
+     Noise_W_BS = 10.^((-174 + 10*log10(BS_bw_Hz) + Config.noise_figure_dB - 30)/10);
+ 
+-    % Indoor/outdoor state is a property of the UE: draw it once, not every snapshot.
+-    ue_is_indoor = rand(num_UEs, 1) < Config.indoor_user_percentage;
+-    
+     Rej_Factor_Lin = 10^(Config.cso_sll_rejection_dB/10);
+     
+     tic;
+@@ -63,6 +70,8 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+         UE_y = UE_y + ue_sp .* sin(ue_dir) * time_step;
+         
+         batch_size = 200;
++        step_srv = zeros(num_UEs, 1);
++        step_sinr = zeros(num_UEs, 1);
+         running_sinr_dB_sum = 0; 
+         
+         running_tput_sum = 0;
+@@ -185,11 +194,22 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+             if t == sim_steps
+                 ue_sinr_final(idx) = SINR_dB;
+             end
++            step_srv(idx) = s_idx;
++            step_sinr(idx) = SINR_dB;
+             
+             running_sinr_dB_sum = running_sinr_dB_sum + sum(SINR_dB);
+         end
+         
+         Results.aggregate.avg_sinr_dB(t) = running_sinr_dB_sum / num_UEs;
++
++        % Resource allocation at this snapshot -> network and per-slice throughput
++        se_t = get_spectral_efficiency_from_sinr(step_sinr);
++        tput_t = allocate_cell_throughput(step_srv, se_t(:), Network.gNodeBs.layer_id_row, Config);
++        Results.aggregate.net_throughput_mbps(t) = sum(tput_t);
++        for s = 1:num_slices
++            Results.aggregate.slice_tput_mbps(t, s) = sum(tput_t(ue_slice == s));
++        end
++        if t == sim_steps, final_tput = tput_t; end
+     end
+     toc;
+     
+@@ -202,28 +222,31 @@ function Results = run_hetnet_simulation(Config, Network, UEs)
+     
+     Results.UE.spectral_efficiency = get_spectral_efficiency_from_sinr(Results.UE.sinr_dB);
+     
+-    % Resource sharing per cell. With full buffers and no fast fading, PF
+-    % converges to an equal share of the cell bandwidth. If Config.gbr_mbps > 0,
+-    % users below the GBR first receive the bandwidth they need to reach it
+-    % (thesis Eq. 3.12); the rest is shared equally. Users in outage (SE = 0)
+-    % cannot be lifted to the GBR.
++    % Per-user results are those of the last snapshot (same as before).
++    Results.UE.throughput_mbps = final_tput;
++    
++    fprintf('--- Simulation Complete ---\n');
++end
++
++function tput = allocate_cell_throughput(srv, se, layer_id_row, Config)
++% Resource sharing per cell. With full buffers and no fast fading, PF
++% converges to an equal share of the cell bandwidth. If Config.gbr_mbps > 0,
++% users below the GBR first receive the bandwidth they need to reach it
++% (thesis Eq. 3.12); the rest is shared equally. Users in outage (SE = 0)
++% cannot be lifted to the GBR. Slices share each cell's bandwidth dynamically.
+     gbr_mbps = 0;
+     if isfield(Config, 'gbr_mbps'), gbr_mbps = Config.gbr_mbps; end
+-    Results.UE.throughput_mbps = zeros(num_UEs, 1);
+-    active_bs = unique(served_id_final(served_id_final > 0));
+-    for k = 1:numel(active_bs)
+-        bs_id = active_bs(k);
+-        users = find(served_id_final == bs_id);
+-        bw_MHz = Config.NetworkLayers{Network.gNodeBs.layer_id_row(bs_id)}.bw_MHz;
+-        se = Results.UE.spectral_efficiency(users);
+-        share_MHz = allocate_bandwidth_with_gbr(bw_MHz, se(:), gbr_mbps);
+-        Results.UE.throughput_mbps(users) = share_MHz .* se(:);
++    tput = zeros(numel(srv), 1);
++    [s_sorted, order] = sort(srv(:));
++    starts = [find([true; diff(s_sorted) ~= 0]); numel(s_sorted) + 1];
++    for k = 1:numel(starts) - 1
++        bs_id = s_sorted(starts(k));
++        if bs_id == 0, continue; end
++        users = order(starts(k):starts(k+1) - 1);
++        bw_MHz = Config.NetworkLayers{layer_id_row(bs_id)}.bw_MHz;
++        share_MHz = allocate_bandwidth_with_gbr(bw_MHz, se(users), gbr_mbps);
++        tput(users) = share_MHz .* se(users);
+     end
+-    total_network_tput = sum(Results.UE.throughput_mbps);
+-    
+-    Results.aggregate.net_throughput_mbps(:) = total_network_tput;
+-    
+-    fprintf('--- Simulation Complete ---\n');
+ end
+ 
+ function share = allocate_bandwidth_with_gbr(bw_MHz, se, gbr_mbps)
+-- 
+2.43.0
+
